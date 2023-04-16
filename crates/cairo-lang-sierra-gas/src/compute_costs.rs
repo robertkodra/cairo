@@ -20,6 +20,10 @@ use crate::gas_info::GasInfo;
 use crate::objects::{BranchCost, ConstCost, CostInfoProvider, PreCost};
 use crate::CostError;
 
+#[cfg(test)]
+#[path = "compute_costs_test.rs"]
+mod test;
+
 type VariableValues = OrderedHashMap<(StatementIdx, CostTokenType), i64>;
 
 /// A trait for the cost type (either [PreCost] for pre-cost computation, or `i32` for the post-cost
