@@ -4,21 +4,17 @@
 // 3. Withdraw gas builtins.
 // 4. refund gas
 
-use cairo_lang_sierra::extensions::core::{CoreLibfunc, CoreType};
-use cairo_lang_sierra::extensions::gas::CostTokenType;
-use cairo_lang_sierra::extensions::ConcreteType;
-use cairo_lang_sierra::ids::{ConcreteLibfuncId, ConcreteTypeId};
+use cairo_lang_sierra::extensions::gas::{BuiltinCostWithdrawGasLibfunc, CostTokenType};
+use cairo_lang_sierra::ids::ConcreteLibfuncId;
 use cairo_lang_sierra::program::{Invocation, Program, Statement, StatementIdx};
-use cairo_lang_sierra::program_registry::ProgramRegistry;
+use cairo_lang_utils::casts::IntoOrPanic;
 use cairo_lang_utils::iterators::zip_eq3;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use itertools::zip_eq;
 
-use crate::core_libfunc_cost_base::core_libfunc_cost;
 use crate::gas_info::GasInfo;
-use crate::objects::{BranchCost, ConstCost, CostInfoProvider, PreCost};
-use crate::CostError;
+use crate::objects::{BranchCost, ConstCost, PreCost};
 
 #[cfg(test)]
 #[path = "compute_costs_test.rs"]
@@ -48,25 +44,6 @@ impl CostTypeTrait for PreCost {
         }
         res
     }
-}
-
-pub fn compute_postcost_info(
-    program: &Program,
-    get_ap_change_fn: &dyn Fn(&StatementIdx) -> usize,
-) -> Result<GasInfo, CostError> {
-    let registry = ProgramRegistry::<CoreType, CoreLibfunc>::new(program)?;
-    let info_provider = ComputeCostInfoProviderImpl { registry: &registry };
-    let specific_cost_context = PostcostContext { get_ap_change_fn };
-    Ok(compute_costs(
-        program,
-        &(|libfunc_id| {
-            let core_libfunc = registry
-                .get_libfunc(libfunc_id)
-                .expect("Program registry creation would have already failed.");
-            core_libfunc_cost(core_libfunc, &info_provider)
-        }),
-        &specific_cost_context,
-    ))
 }
 
 /// Computes the [GasInfo] for a given program.
@@ -143,6 +120,7 @@ fn analyze_gas_statements<
             //   align.
             if let BranchCost::WithdrawGas { success: true, .. } = branch_cost {
                 for (token_type, amount) in specific_context.get_withdraw_gas_values(
+                    idx,
                     branch_cost,
                     &wallet_value,
                     future_wallet_value,
@@ -181,6 +159,7 @@ pub trait SpecificCostContextTrait<CostType: CostTypeTrait> {
     /// Computes the value that should be withdrawn and added to the wallet for each token type.
     fn get_withdraw_gas_values(
         &self,
+        idx: &StatementIdx,
         branch_cost: &BranchCost,
         wallet_value: &CostType,
         future_wallet_value: CostType,
@@ -316,6 +295,7 @@ impl SpecificCostContextTrait<PreCost> for PreCostContext {
 
     fn get_withdraw_gas_values(
         &self,
+        _idx: &StatementIdx,
         _branch_cost: &BranchCost,
         wallet_value: &PreCost,
         future_wallet_value: PreCost,
@@ -373,8 +353,9 @@ impl SpecificCostContextTrait<PreCost> for PreCostContext {
     }
 }
 
-struct PostcostContext<'a> {
-    get_ap_change_fn: &'a dyn Fn(&StatementIdx) -> usize,
+pub struct PostcostContext<'a> {
+    pub get_ap_change_fn: &'a dyn Fn(&StatementIdx) -> usize,
+    pub precost_gas_info: &'a GasInfo,
 }
 
 impl<'a> SpecificCostContextTrait<i32> for PostcostContext<'a> {
@@ -388,18 +369,27 @@ impl<'a> SpecificCostContextTrait<i32> for PostcostContext<'a> {
 
     fn get_withdraw_gas_values(
         &self,
+        idx: &StatementIdx,
         branch_cost: &BranchCost,
         wallet_value: &i32,
         future_wallet_value: i32,
     ) -> OrderedHashMap<CostTokenType, i64> {
-        // TODO: with_builtin_costs.
-
-        let BranchCost::WithdrawGas { const_cost, success: true, with_builtin_costs: _ } = branch_cost else {
+        let BranchCost::WithdrawGas { const_cost, success: true, with_builtin_costs } = branch_cost else {
             panic!("Unexpected BranchCost: {:?}.", branch_cost);
         };
 
-        let amount = ((const_cost.cost() + future_wallet_value) as i64) - (*wallet_value as i64);
-        [(CostTokenType::Const, amount as i64)].into_iter().collect()
+        let mut amount =
+            ((const_cost.cost() + future_wallet_value) as i64) - (*wallet_value as i64);
+
+        if *with_builtin_costs {
+            let steps = BuiltinCostWithdrawGasLibfunc::cost_computation_steps(|token_type| {
+                self.precost_gas_info.variable_values[(*idx, token_type)].into_or_panic()
+            })
+            .into_or_panic::<i32>();
+            amount += ConstCost { steps, ..Default::default() }.cost().into_or_panic::<i64>();
+        }
+
+        [(CostTokenType::Const, amount)].into_iter().collect()
     }
 
     fn get_branch_align_values(
@@ -433,9 +423,21 @@ impl<'a> SpecificCostContextTrait<i32> for PostcostContext<'a> {
                     BranchCost::FunctionCall { const_cost, function } => {
                         wallet_at_fn(&function.entry_point) + const_cost.cost()
                     }
-                    BranchCost::WithdrawGas { const_cost, success, with_builtin_costs: _ } => {
-                        let cost = const_cost.cost();
-                        // TODO: with_builtins.
+                    BranchCost::WithdrawGas { const_cost, success, with_builtin_costs } => {
+                        let mut cost = const_cost.cost();
+
+                        if *with_builtin_costs {
+                            // TODO(lior): Avoid code duplication with get_withdraw_gas_values.
+                            let steps = BuiltinCostWithdrawGasLibfunc::cost_computation_steps(
+                                |token_type| {
+                                    self.precost_gas_info.variable_values[(*idx, token_type)]
+                                        .into_or_panic()
+                                },
+                            )
+                            .into_or_panic::<i32>();
+                            cost += ConstCost { steps, ..Default::default() }.cost();
+                        }
+
                         // If withdraw_gas succeeds, we don't need to take
                         // future_wallet_value into account, so we simply return.
                         if *success {
