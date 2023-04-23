@@ -1264,3 +1264,9 @@ impl U128Felt252DictValue of Felt252DictValue<u128> {
         0
     }
 }
+
+/// Computes a * b^(-1) modulo n.
+extern fn u8_div_mod_n(a: u8, b: NonZero<u8>, n: u8) -> u8 implicits(RangeCheck) nopanic;
+extern fn u16_div_mod_n(a: u16, b: NonZero<u16>, n: u16) -> u16 implicits(RangeCheck) nopanic;
+extern fn u32_div_mod_n(a: u32, b: NonZero<u32>, n: u32) -> u32 implicits(RangeCheck) nopanic;
+extern fn u64_div_mod_n(a: u64, b: NonZero<u64>, n: u64) -> u64 implicits(RangeCheck) nopanic;

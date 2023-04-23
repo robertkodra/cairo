@@ -394,6 +394,40 @@ pub fn build_small_wide_mul(
     ))
 }
 
+/// Handles a operation of dividing uints modulo another uint.
+pub fn build_div_mod_n(
+    builder: CompiledInvocationBuilder<'_>,
+) -> Result<CompiledInvocation, InvocationError> {
+    let [range_check, a, b, n] = builder.try_get_single_cells()?;
+    let mut casm_builder = CasmBuilder::default();
+    add_input_variables! {casm_builder,
+        buffer(3) range_check;
+        deref value;
+    };
+
+    casm_build_extend! {casm_builder,
+        let orig_range_check = range_check;
+        tempvar k;
+        tempvar res;
+
+        // Guess (res, k), where res < n, 2**64*n + a = b*res + k*n (=> n | a-b*res => a/b = res (mod n)).
+        // TODO(yg): add hint.
+        hint DivModN { a, b, n } into { res, k, bres, kn };
+
+        // TODO(yg): verify 2**64*n + a = bres + kn. Note that 2**64 is enough for all u8/u16/u32/u64 and is easier to add than 2**x for ux.
+    };
+
+    // TODO(yg): Copied from build_sqrt - change as needed.
+    Ok(builder.build_from_casm_builder(
+        casm_builder,
+        [("Fallthrough", &[&[range_check], &[res]], None)],
+        CostValidationInfo {
+            range_check_info: Some((orig_range_check, range_check)),
+            extra_costs: None,
+        },
+    ))
+}
+
 /// Builds instructions for Sierra u8/u16/u32/u64 operations.
 pub fn build_uint<TUintTraits: UintMulTraits + IsZeroTraits, const LIMIT: u128>(
     libfunc: &UintConcrete<TUintTraits>,
@@ -416,5 +450,6 @@ pub fn build_uint<TUintTraits: UintMulTraits + IsZeroTraits, const LIMIT: u128>(
         UintConcrete::IsZero(_) => misc::build_is_zero(builder),
         UintConcrete::Divmod(_) => build_divmod::<LIMIT>(builder),
         UintConcrete::WideMul(_) => build_small_wide_mul(builder),
+        UintConcrete::DivModN(_) => build_div_mod_n(builder),
     }
 }
